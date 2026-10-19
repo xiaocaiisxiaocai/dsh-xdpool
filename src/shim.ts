@@ -13,7 +13,7 @@
  *
  * @module dsh-xdpool/shim
  */
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { Readable, Transform } from 'node:stream'
 import type { WorkBuddyAccount, WorkBuddyAccountPool } from './accounts.ts'
@@ -250,6 +250,43 @@ function conversationKeyOf(raw: string): string | undefined {
     return undefined
   }
 }
+
+/**
+ * Map a conversation key onto the `X-Conversation-ID` the upstream is told.
+ *
+ * WHY A CACHE AND NOT A FRESH UUID PER REQUEST
+ *
+ * The gateway accepts any well-formed UUID as `X-Conversation-ID`, but the id is
+ * what the upstream files a thread under. Minting a new one per request would
+ * make every turn of a DSH conversation look like a brand-new upstream thread,
+ * which is a lie the billing and history views would have to live with. Keying
+ * off the same first-user-message hash `sticky` already uses keeps one DSH
+ * conversation on one upstream thread, and a new chat on a new one.
+ *
+ * The map is bounded because a long-lived shim would otherwise accumulate one
+ * entry per conversation forever. Eviction only costs a thread boundary.
+ */
+const CONVERSATION_ID_CACHE_LIMIT = 512
+const conversationIds = new Map<string, string>()
+
+function upstreamConversationId(key: string | undefined): string | undefined {
+  if (key === undefined) return undefined
+  const known = conversationIds.get(key)
+  if (known !== undefined) {
+    // Refresh insertion order so the hot conversations are the ones that survive.
+    conversationIds.delete(key)
+    conversationIds.set(key, known)
+    return known
+  }
+  const minted = randomUUID()
+  conversationIds.set(key, minted)
+  if (conversationIds.size > CONVERSATION_ID_CACHE_LIMIT) {
+    const oldest = conversationIds.keys().next()
+    if (oldest.done !== true) conversationIds.delete(oldest.value)
+  }
+  return minted
+}
+
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
@@ -646,7 +683,12 @@ function withBareModelId(raw: string, modelId: string): string {
           continue
         }
         const prepared = client.prepareChatBody(raw)
-        const result = await client.chatStream(account.credential, prepared, signal)
+        const result = await client.chatStream(
+          account.credential,
+          prepared,
+          signal,
+          upstreamConversationId(conversationKeyOf(raw)),
+        )
         if (result.ok) {
           const turnId = randomBytes(8).toString('hex')
           await serveSuccessfulStream(
@@ -906,7 +948,12 @@ function withBareModelId(raw: string, modelId: string): string {
         return
       }
       tried.push(account.label)
-      const result = await client.chatStream(account.credential, prepared, controller.signal)
+      const result = await client.chatStream(
+        account.credential,
+        prepared,
+        controller.signal,
+        upstreamConversationId(conversationKey),
+      )
       if (result.ok) {
         // Success is filed by the stream forwarder, the only place that knows
         // when the stream really ended and what it cost.
@@ -1334,7 +1381,12 @@ async function recoverFromContextOverrun(options: RecoverOptions): Promise<Recov
     const account = await pool.acquire(modelId, region)
     if (account === undefined) return { ok: false, detail: 'no account available after compaction' }
     tried.push(account.label)
-    const result = await client.chatStream(account.credential, retryBody, controller.signal)
+    const result = await client.chatStream(
+      account.credential,
+      retryBody,
+      controller.signal,
+      upstreamConversationId(conversationKeyOf(retryBody)),
+    )
     if (!result.ok) {
       // A refusal is filed like any other failed physical call. The success
       // below deliberately is NOT: that one is filed by the forwarder when the

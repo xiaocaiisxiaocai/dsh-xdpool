@@ -469,7 +469,9 @@ export declare class WorkBuddyUpstreamClient {
    * Normalize an OpenAI chat-completions body for the WorkBuddy upstream:
    * force `stream: true` (the upstream rejects non-streaming), convert the
    * DSH `developer` role into `system` (upstream rejects `developer` with
-   * business code 11128), and flatten `tool_choice` into its string form.
+   * business code 11128), guarantee a `system` message leads the array (the
+   * gateway rejects anything else with 11128 too — see below), and flatten
+   * `tool_choice` into its string form.
    */
   prepareChatBody(raw: string): string;
   /**
@@ -491,7 +493,7 @@ export declare class WorkBuddyUpstreamClient {
    */
   completeChat(credential: WorkBuddyCredential, prepared: string, signal?: AbortSignal): Promise<string>;
   /** Forward one chat completion. Never throws for upstream failures. */
-  chatStream(credential: WorkBuddyCredential, prepared: string, signal?: AbortSignal): Promise<ChatStreamResult>;
+  chatStream(credential: WorkBuddyCredential, prepared: string, signal?: AbortSignal, conversationId?: string): Promise<ChatStreamResult>;
   /** POST the token-refresh endpoint; the caller merges the outcome. */
   refreshToken(credential: WorkBuddyCredential): Promise<WorkBuddyRefreshOutcome>;
   /**

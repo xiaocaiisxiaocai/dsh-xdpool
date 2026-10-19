@@ -1,6 +1,7 @@
 # Changelog
 本项目的所有重要变更都会记录在此文件。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+
 ## 未发布 — 免密车道可以换出口（HTTP CONNECT 代理）
 > 免费模型这条车道原来只有一个出口：本机地址。上游一旦按 IP 判决（OpenCode 免费池就这么干，报 `free_client` + “abusive traffic from this IP”），宿主侧没有任何开关能把它换个出口 —— 换节点、开代理软件都没用，因为 `freeFetch` 走的是 `node:https` 直连，不认 `HTTP(S)_PROXY`。
 ### 现象
@@ -35,6 +36,37 @@
   - 与 `src/upstream.ts` 的 `chatConversationHeaders()` 同源实现；注释写明为什么不在宿主侧包 `fetch`——挂载入口 `apply(ctx, ...)` 没有可注入 fetch 的缝，唯一替代是改全局 `fetch`，那会波及同进程里所有插件的请求。
 - 新增 `tests/vendor-pack-chat-conversation-headers.test.ts`：静态钉住三条头只在 `send()` 出现一次、补头窗口覆盖 chat 出口；行为层把随包发布的三个函数切出来在沙箱里跑，验证「同会话稳定 / 跨会话不同 / UUID 形状 / 请求与消息 id 每次新造 / 无 user 消息退回 sessionId / 坏 JSON 不抛」。vendored 包不能直接 import（它依赖宿主版本的 `@deepseek-ai/schemastery`，独立进程里 `.volatile()` 不存在），所以用切片执行而不是 import。
 - `vendor/channel-pack/NOTICE.md` 记录这处本地补丁，避免下次重构建静默丢掉。
+## 未发布 — WorkBuddy 主聊天车道恢复（网关 400 / code 11128）
+> 一次彻头彻尾的车道中断：所有 WorkBuddy 聊天请求被上游网关拒收，报 400 + code 11128「request illegal」，提示语还说是「没通过渠道校验、不是官方客户端发出的」。提示语是骗人的。
+### 现象
+在 DSH 里选任一 WorkBuddy 模型发起对话，立刻失败：
+```
+400 workbuddy upstream client (http 400) after 1 account(s) [xxx@gmail.com#a184c1c1]:
+{"code":11128,"msg":"request illegal", ..., "displayTips":{...
+  "这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。"}}
+```
+`after 1 account(s)` 说明池子只试了一个账号就停了——`client` 这类错误在轮转循环里是终态。
+### 根因：缺三个会话标识头，与「客户端身份」无关
+从桌面端 `WorkBuddyAI/resources/app.asar` 里取出 `applyGatewayHeaders`，它在每个 `/v2/chat/completions` 上设置三个每次现造的 UUID：
+
+| 头 | 作用 |
+| --- | --- |
+| `X-Conversation-ID` | 会话线程 |
+| `X-Conversation-Request-ID` | 本次请求 |
+| `X-Conversation-Message-ID` | 本条消息 |
+
+三个缺一不可：少任何一个都是 400 / 11128。而 `acp-connection-id`、`X-Request-ID`、B3/traceparent 那几组头**不是**闸门的一部分，去掉照样 200，所以没有跟着抄。
+
+排查时把能想到的变量都试遍了，全部仍是 11128：User-Agent（CodeBuddy CLI / WorkBuddy 桌面 / 各种版本号）、`X-Product` 与 `X-Product-Code` 的各种取值、`X-Agent-Purpose`、`X-IDE-*`、Origin/Referer、Cookie、设备与追踪头、HTTP/1.1 与 HTTP/2、五个域名、九条替代路径、十几个模型、三个账号。**只有补上这三个头，响应才从 400 变成 200 并真的开始吐 token。**
+
+顺带纠正一条流传在 vendor 里的错误结论：`pack.js` 注释称「必须传 system 否则 11128」，对当前国际版网关**不成立**——带 system 照样 11128。11128 真正有两个条件，第二个是 `messages[0].role === 'system'`。
+
+### 修法
+- `upstream.ts` 新增 `chatConversationHeaders()`，两条聊天路径（`chatStream` / `completeChat`）与既有的 `X-IDE-*` 一起发送。
+- `chatStream()` 多一个可选 `conversationId` 参数，由 shim 传入。
+- `shim.ts` 新增 `upstreamConversationId()`：以 `sticky` 已在用的「首条 user 消息哈希」为键，把同一个 DSH 会话映射到同一个上游会话 id（带 512 条上限的 LRU）。这样多轮对话在上游看来是一条线程，而不是每轮一条新线程。
+- `prepareChatBody()` 现在保证 `messages[0]` 是 `system`：已有 system 消息就上提到首位（保留调用方原文），一条都没有才补一条空的。`developer` 先改写成 `system` 再判断，否则 developer 开头的请求仍会撞 11128。
+- 新增 9 条回归用例钉住：三个会话头必须齐、同会话复用会话 id 但每次请求新 id、非聊天端点不得带、`messages[0]` 必须是 system 的四种输入形态。
 ## 2.3.0 — 扫码渠道接入账号池，免密车道修复，数据看板有了真数
 > 这一版收掉三件大事：扫码登录的账号真正归入账号池并按渠道展示；免费模型车道跟上上游的新校验、不再动辄 403；数据看板不再是一排零。
 ### 账号池：扫码渠道按渠道入池、逐模型可控

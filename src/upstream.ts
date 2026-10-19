@@ -417,6 +417,48 @@ const CHAT_IDENTITY_HEADERS: Readonly<Record<string, string>> = Object.freeze({
   'X-IDE-Version': '5.5.6',
 })
 
+/**
+ * The per-turn conversation identifiers the gateway demands before it will
+ * accept a chat completion at all.
+ *
+ * WHY THIS IS NOT OPTIONAL — the 11128 gate
+ *
+ * `POST /v2/chat/completions` answers every request that lacks all three of
+ * these headers with HTTP 400, business code 11128, `msg: "request illegal"`,
+ * and a `displayTips` claiming the call "failed channel verification, possibly
+ * because it was not sent from an official client". That message is misleading:
+ * the gate is not about the User-Agent, the product headers, the origin, the
+ * TLS fingerprint, or the protocol version — each of those was varied against a
+ * live account and none of them moved the response off 11128.
+ *
+ * The desktop app's `applyGatewayHeaders` sets exactly these three, freshly
+ * minted per request, on the same request as the identity headers above. They
+ * are the whole difference. Dropping any one of the three re-triggers 11128;
+ * dropping `acp-connection-id` or `X-Request-ID`, which the desktop app also
+ * sends, does not — so those two stay out, since they are not what the gate
+ * reads and inventing values for them buys nothing.
+ *
+ * `X-Conversation-ID` is per-conversation and stable within it; the request and
+ * message ids are per turn. The shim mints one conversation id per DSH
+ * conversation (so a multi-turn thread looks like one thread upstream) and one
+ * request/message pair per forwarded request.
+ */
+/**
+ * Build the three conversation identifiers for one chat request.
+ *
+ * `conversationId` is supplied by the caller so a whole DSH conversation files
+ * under one upstream thread; the other two are per request and always fresh.
+ */
+function chatConversationHeaders(conversationId?: string): Record<string, string> {
+  return {
+    'X-Conversation-ID': conversationId !== undefined && conversationId !== ''
+      ? conversationId
+      : randomUUID(),
+    'X-Conversation-Request-ID': randomUUID(),
+    'X-Conversation-Message-ID': randomUUID(),
+  }
+}
+
 /** Refresh-endpoint headers; X-Refresh-Token appears here and nowhere else. */
 function refreshHeaders(credential: WorkBuddyCredential): Record<string, string> {
   const headers: Record<string, string> = {
@@ -1109,7 +1151,9 @@ export class WorkBuddyUpstreamClient {
    * Normalize an OpenAI chat-completions body for the WorkBuddy upstream:
    * force `stream: true` (the upstream rejects non-streaming), convert the
    * DSH `developer` role into `system` (upstream rejects `developer` with
-   * business code 11128), and flatten `tool_choice` into its string form.
+   * business code 11128), guarantee a `system` message leads the array (the
+   * gateway rejects anything else with 11128 too — see below), and flatten
+   * `tool_choice` into its string form.
    */
   prepareChatBody(raw: string): string {
     let body: unknown
@@ -1138,6 +1182,27 @@ export class WorkBuddyUpstreamClient {
         if (typeof value !== 'object' || value === null || Array.isArray(value)) continue
         const message = value as Record<string, unknown>
         if (message['role'] === 'developer') message['role'] = 'system'
+      }
+      // The gateway's second 11128 condition: `messages[0]` must be `system`.
+      // Anything else — a bare user turn, a system message sitting later, a
+      // `developer` turn it just relabelled but did not move — is refused with
+      // the same "request illegal / not an official client" text, which is why
+      // this used to look like a client-identity problem. Hoisting the first
+      // system message to the front (rather than synthesising one) keeps the
+      // prompt the caller wrote; a request with no system message at all gets
+      // an empty one, since the gateway only checks the role.
+      const messages = obj['messages'] as unknown[]
+      const leading = messages[0]
+      const leadingRole = typeof leading === 'object' && leading !== null && !Array.isArray(leading)
+        ? (leading as Record<string, unknown>)['role']
+        : undefined
+      if (leadingRole !== 'system') {
+        const at = messages.findIndex((value) => {
+          if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+          return (value as Record<string, unknown>)['role'] === 'system'
+        })
+        if (at > 0) messages.unshift(...messages.splice(at, 1))
+        else if (at < 0) messages.unshift({ role: 'system', content: '' })
       }
     }
     const choice = obj['tool_choice']
@@ -1207,7 +1272,7 @@ export class WorkBuddyUpstreamClient {
   ): Promise<string> {
     const response = await this.fetchImpl(`${chatBase(credential)}/v2/chat/completions`, {
       method: 'POST',
-      headers: { ...chatHeaders(credential), ...CHAT_IDENTITY_HEADERS },
+      headers: { ...chatHeaders(credential), ...CHAT_IDENTITY_HEADERS, ...chatConversationHeaders() },
       body: prepared,
       ...signal === undefined ? {} : { signal },
     })
@@ -1224,12 +1289,17 @@ export class WorkBuddyUpstreamClient {
     credential: WorkBuddyCredential,
     prepared: string,
     signal?: AbortSignal,
+    conversationId?: string,
   ): Promise<ChatStreamResult> {
     let response: Response
     try {
       response = await this.fetchImpl(`${chatBase(credential)}/v2/chat/completions`, {
         method: 'POST',
-        headers: { ...chatHeaders(credential), ...CHAT_IDENTITY_HEADERS },
+        headers: {
+          ...chatHeaders(credential),
+          ...CHAT_IDENTITY_HEADERS,
+          ...chatConversationHeaders(conversationId),
+        },
         body: prepared,
         ...signal === undefined ? {} : { signal },
       })
