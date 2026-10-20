@@ -41,6 +41,7 @@
 import crypto from 'node:crypto'
 import http from 'node:http'
 import https from 'node:https'
+import type { Socket } from 'node:net'
 import { Readable } from 'node:stream'
 import { ReadableStream } from 'node:stream/web'
 import {
@@ -58,6 +59,7 @@ import {
   type FreeEvent,
   type FreeWire,
 } from './free-messages.ts'
+import { freeProxy, openTunnel, tlsOverTunnel } from './free-proxy.ts'
 
 export type { FingerprintPlan }
 
@@ -641,8 +643,15 @@ export const freeLane = { fetch: null as unknown }
  * plugins work by replacing `globalThis.fetch` and re-serializing the body on the
  * way out — which mangles a JSON body enough to change the turn. The native
  * modules cannot be swapped by another plugin.
+ *
+ * WHEN AN EGRESS IS CONFIGURED (`XDPOOL_FREE_PROXY` or `.xdpool/free-proxy`),
+ * HTTPS targets go through that proxy's CONNECT tunnel instead of straight out.
+ * Only this lane is affected: the pool's paid lanes keep their own routing, and
+ * `globalThis.fetch` is never touched. A failed tunnel is reported, never
+ * silently replaced by a direct send — falling back would expose the very
+ * address the user just asked us not to use.
  */
-export function freeFetch(
+export async function freeFetch(
   url: string,
   init: {
     method?: string
@@ -654,8 +663,31 @@ export function freeFetch(
   const method = init.method ?? 'GET'
   const stub = freeLane.fetch as unknown as { fetch?: (url: string, init: unknown) => Promise<Response> } | null
   if (stub !== null && typeof stub.fetch === 'function') return stub.fetch(url, { method, ...init })
+  const target = new URL(url)
+  const proxy = target.protocol === 'https:' ? freeProxy() : undefined
+  if (proxy === undefined) return sendDirect(target, method, init)
+  const tunnel = await openTunnel(proxy, target.hostname, Number(target.port || 443), {
+    timeoutMs: FREE_PROXY_CONNECT_TIMEOUT_MS,
+    signal: init.signal,
+  })
+  return sendDirect(target, method, init, tunnel)
+}
+
+/** How long the CONNECT handshake may take before the turn is failed. */
+const FREE_PROXY_CONNECT_TIMEOUT_MS = 15_000
+
+/** One request on the native transport, optionally over an established tunnel. */
+function sendDirect(
+  target: URL,
+  method: string,
+  init: {
+    headers?: Record<string, string>
+    body?: string | undefined
+    signal?: AbortSignal | undefined
+  },
+  tunnel?: Socket,
+): Promise<Response> {
   return new Promise((resolve, reject) => {
-    const target = new URL(url)
     const transport = target.protocol === 'http:' ? http : https
     const request = transport.request(
       {
@@ -668,6 +700,11 @@ export function freeFetch(
           init.body === undefined
             ? (init.headers ?? {})
             : { ...(init.headers ?? {}), 'content-length': Buffer.byteLength(init.body, 'utf8') },
+        // A tunnel replaces name resolution and the TCP dial: the socket handed
+        // back already reaches the target host, so TLS is layered on top of it.
+        ...(tunnel === undefined
+          ? {}
+          : { agent: false, createConnection: () => tlsOverTunnel(tunnel, target.hostname) }),
       },
       response => {
         resolve(
@@ -679,8 +716,12 @@ export function freeFetch(
         )
       },
     )
-    request.on('error', reject)
+    request.on('error', error => {
+      tunnel?.destroy()
+      reject(error)
+    })
     const abort = (): void => {
+      tunnel?.destroy()
       request.destroy(new Error('The operation was aborted'))
     }
     init.signal?.addEventListener('abort', abort, { once: true })

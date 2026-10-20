@@ -1,6 +1,17 @@
 # Changelog
 本项目的所有重要变更都会记录在此文件。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+## 未发布 — 免密车道可以换出口（HTTP CONNECT 代理）
+> 免费模型这条车道原来只有一个出口：本机地址。上游一旦按 IP 判决（OpenCode 免费池就这么干，报 `free_client` + “abusive traffic from this IP”），宿主侧没有任何开关能把它换个出口 —— 换节点、开代理软件都没用，因为 `freeFetch` 走的是 `node:https` 直连，不认 `HTTP(S)_PROXY`。
+### 现象
+- DSH 里选免费车道的模型，整轮失败：`400 {"type":"free_client","message":"...OpenCode's free models aren't available from your current network because we've detected abusive traffic from this IP address..."}`
+- 同一台机器 `curl --proxy` 与直连的出口 IP 完全相同（TUN 全局接管），说明问题不在「有没有代理」，而在「这条车道根本不出代理」。
+### 修法
+- 新增 `src/free-proxy.ts`：HTTP CONNECT 隧道（`http://` / `https://` 代理，支持 `user:pass@`）。只作用于免密车道的 HTTPS 请求，不动全局 `fetch`、不影响付费车道与渠道包。
+- 配置两处，环境变量优先：`XDPOOL_FREE_PROXY=http://127.0.0.1:7890`，或 `<DSH_HOME>/.xdpool/free-proxy` 里一行同样的 URL（`#` 注释、空行忽略）。空值/畸形值 = 直连，配置坏掉不会让池子起不来。
+- `freeFetch()` 改成：先按代理开 CONNECT 隧道，再在隧道之上做 TLS（`createConnection` + `tls.connect({ socket })`）。**隧道失败直接报错，绝不回落直连** —— 回落等于把用户明确要求藏起来的出口重新暴露出去。
+- 新增 `tests/free-proxy.test.ts`（10 条）：URL 解析/凭据/畸形值、环境变量优先级、CONNECT 请求行与 407 拒绝、`freeFetch` 配了代理必须先 CONNECT、没配代理不得碰代理、测试接缝优先于配置。
+- `lib/` 随之重建（本机无完整 devDeps，构建用 tsdown 0.23.0 + 关闭 dts，`index.d.ts` 保持原样：公共 API 未变）。
 ## 未发布 — WorkBuddy / CodeBuddy 渠道车道补回三条会话标识头（网关 400 / code 11128）
 > 池里的 WorkBuddy 账号今天起每一次聊天都失败：「workbuddy: 请求被拦截，请重新发送 request illegal」。主池车道 10-19 就补过这三个头，**vendored 渠道包这条车道一直没补**；上游把 11128 的检查扩到 `productCode=workbuddy` 之后，整条渠道（含本地 OpenAI 网关）全灭。
 ### 现象
