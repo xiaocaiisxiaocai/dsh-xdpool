@@ -1,6 +1,29 @@
 # Changelog
 本项目的所有重要变更都会记录在此文件。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+## 未发布 — WorkBuddy / CodeBuddy 渠道车道补回三条会话标识头（网关 400 / code 11128）
+> 池里的 WorkBuddy 账号今天起每一次聊天都失败：「workbuddy: 请求被拦截，请重新发送 request illegal」。主池车道 10-19 就补过这三个头，**vendored 渠道包这条车道一直没补**；上游把 11128 的检查扩到 `productCode=workbuddy` 之后，整条渠道（含本地 OpenAI 网关）全灭。
+### 现象
+- DSH 里选 `workbuddy` 渠道的任一模型（`deepseek-v4.1-flash` / `hy3` / `glm-5.3-flash` / `kimi-k2.6` / `default-model`），一次都跑不起来：HTTP `400` + `{"code":11128,"msg":"request illegal"}`，界面显示「workbuddy: 请求被拦截，请重新发送 request illegal」。
+- `~/.dsh/channel-pack/token-ledger.json` 当天该渠道有请求数、`reportedRequests: 0`、`errors` 等于请求数 —— 请求发出去了，上游一条没接。
+- 同账号、同模型走主池车道（`src/upstream.ts`）正常，说明账号、额度、出口都没问题。
+### 根因：vendored `BuddyAdapter.send()` 缺三条会话标识头
+`/v2/chat/completions` 的门禁是两段：客户端身份（`X-IDE-*`）与会话身份（`X-Conversation-ID` / `-Request-ID` / `-Message-ID`）。渠道包 `vendor/channel-pack/pack.js` 的 `send()` 只设了前一段，后一段一条都没有。同账号直连网关实测：
+
+| 请求头 | 结果 |
+| --- | --- |
+| 渠道包原样（无三条会话头） | `400` / `11128`「request illegal」 |
+| 补齐三条 | 过门禁（返回 `429` `14003` 模型繁忙，属可重试业务态） |
+
+昨天这条车道还通（24 次请求 21 次成功），今天全 `400` —— 上游把这条检查扩到了 `productCode=workbuddy` 的客户端上，渠道包没跟上。
+### 修法
+- `vendor/channel-pack/pack.js`：新增 `firstUserMessageSeed()` / `conversationScopedId()` / `chatConversationHeaders()`，`BuddyAdapter.send()` 补三条头。
+  - `X-Conversation-ID` 由**首条 user 消息**哈希确定性派生（UUID 形状，版本位 4、变体位 8）：同一会话多轮、跨进程、换号重发都落回同一条上游线程。只按每次随机也能过门禁，但每回合在上游都是一条新线程，线程视图会碎、连续会话的计价也拿不到。
+  - `X-Conversation-Request-ID` / `X-Conversation-Message-ID` 每次调用现造，重试不会被当成重复请求去重。
+  - `send()` 是这条车道唯一的 chat 出口（首轮与换号/换代理重试都走它），签到、报表、积分那类非聊天端点不受影响。
+  - 与 `src/upstream.ts` 的 `chatConversationHeaders()` 同源实现；注释写明为什么不在宿主侧包 `fetch`——挂载入口 `apply(ctx, ...)` 没有可注入 fetch 的缝，唯一替代是改全局 `fetch`，那会波及同进程里所有插件的请求。
+- 新增 `tests/vendor-pack-chat-conversation-headers.test.ts`：静态钉住三条头只在 `send()` 出现一次、补头窗口覆盖 chat 出口；行为层把随包发布的三个函数切出来在沙箱里跑，验证「同会话稳定 / 跨会话不同 / UUID 形状 / 请求与消息 id 每次新造 / 无 user 消息退回 sessionId / 坏 JSON 不抛」。vendored 包不能直接 import（它依赖宿主版本的 `@deepseek-ai/schemastery`，独立进程里 `.volatile()` 不存在），所以用切片执行而不是 import。
+- `vendor/channel-pack/NOTICE.md` 记录这处本地补丁，避免下次重构建静默丢掉。
 ## 2.3.0 — 扫码渠道接入账号池，免密车道修复，数据看板有了真数
 > 这一版收掉三件大事：扫码登录的账号真正归入账号池并按渠道展示；免费模型车道跟上上游的新校验、不再动辄 403；数据看板不再是一排零。
 ### 账号池：扫码渠道按渠道入池、逐模型可控

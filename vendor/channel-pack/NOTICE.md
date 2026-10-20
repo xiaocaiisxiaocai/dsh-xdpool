@@ -43,6 +43,14 @@ rm -rf vendor/channel-pack/node_modules
 
 ## OFM 本地适配
 
+- `pack.js`（就地补丁，无 `src/` 可改）：`BuddyAdapter.send()` 为 `/v2/chat/completions`
+  补齐三条会话标识头 `X-Conversation-ID` / `X-Conversation-Request-ID` /
+  `X-Conversation-Message-ID`。上游网关缺任意一条即 HTTP 400 + 业务码 11128
+  `request illegal`，与 UA、`X-Product*`、`X-Agent-Purpose`、TLS 均无关；
+  主池车道 `src/upstream.ts` 早有同源实现，渠道包这条车道此前漏了。
+  会话 id 由首条 user 消息哈希确定性派生（同会话稳定），请求/消息 id 每次现造。
+  **再构建前必须把这段补丁同步回 `src/`**（本仓库未收录该 `src/`，见上节），
+  否则下一次打包会静默退回 11128。回归用例：`tests/vendor-pack-chat-conversation-headers.test.ts`。
 - `src/index.ts`：增加可选 `disableOpencode` 挂载配置；OFM 开启它时跳过重复 OpenCode adapter、默认匿名账号和能力表预热，保留历史账号及凭据。省略时维持上游行为。
 - `src/channel-pack-rpc.ts`：追加同一配置，关闭时拒绝 `opencode.*` 与通用 `account.create(provider=opencode)`。
 - 打包入口改为 `src/index.ts`；宿主模块仍保持外部，jose/undici 内联。
